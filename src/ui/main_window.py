@@ -35,7 +35,8 @@ from src.scheduler import CrawlScheduler, INTERVAL_OPTIONS
 
 class CrawlWorker(QThread):
     """크롤링을 백그라운드에서 실행."""
-    finished = pyqtSignal(int)  # 새로 저장된 개수
+    # 전체 / YouTube / Instagram 별로 새로 저장된 개수
+    finished = pyqtSignal(int, int, int)
     error = pyqtSignal(str)
 
     def __init__(self, conditions: SearchConditions, search_query: str, run_channel_monitor: bool):
@@ -50,6 +51,7 @@ class CrawlWorker(QThread):
             yt = YouTubeCrawler()
             ig = InstagramCrawler()
             all_rows = []
+            ig_error = None
 
             # 1) YouTube 검색 (검색어 있으면 키워드 검색, 비면 인기/트렌딩)
             rows = yt.search_viral(self.search_query.strip() if self.search_query else "", max_results=25)
@@ -59,7 +61,22 @@ class CrawlWorker(QThread):
             if self.run_channel_monitor:
                 for row in ChannelRepository.list_all("youtube"):
                     _id, platform, ch_id, ch_url, ch_name = row[0], row[1], row[2], row[3], row[4]
-                    cid = ch_id or (yt.channel_id_from_url(ch_url) if ch_url else None)
+                    cid = None
+                    if ch_id:
+                        # 1) 사용자가 진짜 채널 ID(UC로 시작)를 넣은 경우 그대로 사용
+                        if str(ch_id).startswith("UC"):
+                            cid = ch_id
+                        else:
+                            # 2) @handle 또는 커스텀 이름만 넣은 경우 → URL 형태로 변환 후 ID 조회 시도
+                            handle = str(ch_id).strip()
+                            # 이미 @가 붙어 있으면 그대로, 아니라면 @를 붙여서 URL 구성
+                            if not handle.startswith("@"):
+                                handle = "@" + handle
+                            handle_url = f"https://www.youtube.com/{handle}"
+                            cid = yt.channel_id_from_url(handle_url) or ch_id
+                    elif ch_url:
+                        # URL이 있을 때는 URL에서 채널 ID를 추출
+                        cid = yt.channel_id_from_url(ch_url)
                     if cid:
                         rows = yt.channel_latest_videos(cid, max_results=10)
                         all_rows.extend(rows)
@@ -67,13 +84,29 @@ class CrawlWorker(QThread):
                     _id, platform, ch_id, ch_url, ch_name = row[0], row[1], row[2], row[3], row[4]
                     username = ch_id or (ch_url.replace("https://www.instagram.com/", "").replace("https://instagram.com/", "").strip("/").split("?")[0] if ch_url else None) or ch_name
                     if username:
-                        rows = ig.user_recent_videos(username, max_results=10)
-                        all_rows.extend(rows)
+                        try:
+                            rows = ig.user_recent_videos(username, max_results=10)
+                            all_rows.extend(rows)
+                        except Exception as e:
+                            # 인스타그램 쪽 에러는 전체 크롤링을 중단하지 않고,
+                            # 나중에 상태바에만 안내 메시지를 띄울 수 있도록 저장해 둔다.
+                            ig_error = str(e)
 
-            # 3) 조건 필터 + 중복 제거 저장
+            # 3) 조건 필터
             filtered = filter_by_conditions(all_rows, self.conditions)
-            added = dedupe_and_save(filtered, repo)
-            self.finished.emit(added)
+
+            # 4) 플랫폼별로 중복 제거 + 저장 (YouTube / Instagram 개수 분리)
+            yt_rows = [r for r in filtered if len(r) > 6 and str(r[6]).lower() == "youtube"]
+            ig_rows = [r for r in filtered if len(r) > 6 and str(r[6]).lower() == "instagram"]
+
+            yt_added = dedupe_and_save(yt_rows, repo) if yt_rows else 0
+            ig_added = dedupe_and_save(ig_rows, repo) if ig_rows else 0
+            total_added = yt_added + ig_added
+
+            # 메인 스레드에 결과 전달
+            self.finished.emit(total_added, yt_added, ig_added)
+            if ig_error:
+                self.error.emit(ig_error)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -148,7 +181,11 @@ class MainWindow(QMainWindow):
         self.channel_list = QTableWidget()
         self.channel_list.setColumnCount(4)
         self.channel_list.setHorizontalHeaderLabels(["플랫폼", "채널 ID/URL", "채널명", "삭제"])
-        self.channel_list.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        ch_header = self.channel_list.horizontalHeader()
+        ch_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)   # 플랫폼
+        ch_header.setSectionResizeMode(1, QHeaderView.Stretch)            # 채널 ID/URL (가장 넓게)
+        ch_header.setSectionResizeMode(2, QHeaderView.Stretch)            # 채널명
+        ch_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)   # 삭제 버튼
         self.channel_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
         ch_layout.addWidget(self.channel_list)
         layout.addWidget(ch_group)
@@ -217,11 +254,71 @@ class MainWindow(QMainWindow):
         if not text:
             return
         platform = "youtube" if self.platform_combo.currentText() == "YouTube" else "instagram"
-        if platform == "youtube":
-            self.channel_repo.add(platform, channel_url=text if "youtube" in text or "youtu" in text else None, channel_id=text if not text.startswith("http") else None)
-        else:
-            username = text.replace("https://www.instagram.com/", "").replace("https://instagram.com/", "").strip("/").split("?")[0].strip() or text
-            self.channel_repo.add(platform, channel_id=username, channel_url=f"https://www.instagram.com/{username}/")
+
+        # UI에 크롤링/조회 중임을 표시
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.statusBar().showMessage("채널 정보 조회 및 추가 중...", 0)
+        success = False
+        try:
+            if platform == "youtube":
+                # YouTube 채널명 자동 채우기 시도
+                yt = YouTubeCrawler()
+                ch_id = None
+                ch_url = None
+                ch_name = ""
+                raw = text.strip()
+                if raw.startswith("http"):
+                    ch_url = raw
+                    ch_id = yt.channel_id_from_url(raw) or None
+                else:
+                    # UC로 시작하면 채널 ID, 아니면 @handle 또는 핸들 후보로 처리
+                    if raw.startswith("UC"):
+                        ch_id = raw
+                    else:
+                        handle = raw
+                        if not handle.startswith("@"):
+                            handle = "@" + handle
+                        ch_url = f"https://www.youtube.com/{handle}"
+                        ch_id = yt.channel_id_from_url(ch_url) or None
+                # 채널 ID가 있으면 최신 영상 1개를 조회해서 채널명 추출 (API 키 필요)
+                try:
+                    if ch_id:
+                        rows = yt.channel_latest_videos(ch_id, max_results=1)
+                        if rows:
+                            # (title, channel_name, view_count, subscriber_count, upload_date, video_url, platform)
+                            ch_name = rows[0][1] or ""
+                except Exception:
+                    # 채널명 조회 실패해도 추가 자체는 진행
+                    pass
+                self.channel_repo.add(
+                    platform,
+                    channel_id=ch_id or raw,
+                    channel_url=ch_url or (raw if raw.startswith("http") else ""),
+                    channel_name=ch_name,
+                )
+            else:
+                # Instagram: username을 정규화해서 채널명으로 사용
+                username = (
+                    text.replace("https://www.instagram.com/", "")
+                    .replace("https://instagram.com/", "")
+                    .strip("/")
+                    .split("?")[0]
+                    .strip()
+                    or text
+                )
+                self.channel_repo.add(
+                    platform,
+                    channel_id=username,
+                    channel_url=f"https://www.instagram.com/{username}/",
+                    channel_name=username,
+                )
+            success = True
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.statusBar().clearMessage()
+
+        if success:
+            self.statusBar().showMessage("채널이 추가되었습니다.", 3000)
         self.channel_input.clear()
         self.refresh_channels()
 
@@ -277,11 +374,13 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self._on_crawl_error)
         self.worker.start()
 
-    def _on_crawl_finished(self, added: int):
+    def _on_crawl_finished(self, added: int, yt_added: int, ig_added: int):
         self.refresh_results()
         # 마지막 크롤링 시각 갱신
         now = datetime.now().astimezone()
-        self.last_crawl_label.setText(f"마지막 크롤링(성공): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.last_crawl_label.setText(
+            f"마지막 크롤링(성공): {now.strftime('%Y-%m-%d %H:%M:%S')}  |  YouTube: {yt_added}개, Instagram: {ig_added}개 (신규 저장)"
+        )
         if not self.scheduler.is_running:
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
@@ -291,13 +390,16 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("크롤링 완료 (추가된 영상 없음). 결과 탭에서 확인하세요.", 5000)
 
     def _on_crawl_error(self, msg: str):
-        self.statusBar().showMessage("크롤링 오류 발생", 3000)
-        now = datetime.now().astimezone()
-        self.last_crawl_label.setText(f"마지막 크롤링(실패): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        # Instagram 레이트리밋(잠시 후 다시 시도) 메시지 감지
+        if "Please wait a few minutes before you try again" in msg:
+            friendly = "Instagram에서 요청을 잠시 제한했습니다. 잠시 후 다시 시도해 주세요."
+            self.statusBar().showMessage(friendly, 10000)
+        else:
+            self.statusBar().showMessage("크롤링 오류 발생", 3000)
         if not self.scheduler.is_running:
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
-        QMessageBox.warning(self, "크롤링 오류", msg)
+        # 팝업 대신 상태바 메시지로만 알림
 
     def stop_crawling(self):
         self.scheduler.stop()

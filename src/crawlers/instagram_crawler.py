@@ -1,6 +1,7 @@
 """Instagram 크롤링: instaloader로 공개 프로필 최신 영상 수집 (로그인 없이)."""
 import time
 import re
+import traceback
 from typing import List, Tuple, Optional
 
 PLATFORM = "instagram"
@@ -90,6 +91,9 @@ class InstagramCrawler:
                     (title, username, view_count, followers, date_str, url, PLATFORM)
                 )
                 time.sleep(self.delay * 0.5)
-        except Exception:
-            pass
+        except Exception as e:
+            # 콘솔에 상세 에러 출력 후, 상위에서 처리할 수 있도록 예외를 다시 발생시킨다.
+            print(f"[InstagramCrawler] 에러 발생 (username={username!r}): {e}")
+            traceback.print_exc()
+            raise
         return out
