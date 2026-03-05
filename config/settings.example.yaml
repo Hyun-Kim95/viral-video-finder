@@ -1,0 +1,21 @@
+# Viral Video Finder - 설정 예시
+# 이 파일을 settings.yaml 로 복사 후 값 입력
+
+# YouTube (선택)
+youtube:
+  api_key: ""  # YouTube Data API v3 키
+  use_api: true  # false 시 HTML 크롤링 시도
+
+# Instagram (선택, 정책상 제한 많음)
+instagram:
+  use_selenium: true  # Selenium 기반 크롤링
+
+# 크롤링
+crawling:
+  request_delay_sec: 2  # 요청 간격 (rate limit 완화)
+  max_retries: 3
+  timeout_sec: 30
+
+# 스케줄
+schedule:
+  default_interval_min: 10  # 5, 10, 30 중 선택 가능
